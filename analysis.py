@@ -47,6 +47,7 @@ warnings.filterwarnings("ignore")
 CONFIG = dict(
     SERIES=["GSE63060", "GSE63061"],
     STATUS_KEEP=["AD", "CTL"],
+    EXCLUDE_SITES=[],          # e.g. ["DCR"] -> AddNeuroMed centres only
     POSITIVE_CLASS="AD",
     FLOOR_K=3.0,
     KDE_BW=0.15,
@@ -79,7 +80,7 @@ CONFIG = dict(
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
 OUT_DIR = os.path.join(HERE, "output")
-RESULTS = os.path.join(OUT_DIR, "results.json")
+RESULTS = os.path.join(OUT_DIR, "results.json")   # overridable via --out
 os.makedirs(OUT_DIR, exist_ok=True)
 
 T0 = time.time()
@@ -192,10 +193,13 @@ def load_data():
     shared = exprs[CONFIG["SERIES"][0]].columns.intersection(
         exprs[CONFIG["SERIES"][1]].columns)
 
-    D, info = {}, dict(n_shared_probes=int(len(shared)), dropped=drops, n={})
+    D, info = {}, dict(n_shared_probes=int(len(shared)), dropped=drops, n={},
+                   excluded_sites=list(CONFIG["EXCLUDE_SITES"]))
     for g in CONFIG["SERIES"]:
         m = metas[g]
         keep = m["status"].isin(CONFIG["STATUS_KEEP"])
+        if CONFIG["EXCLUDE_SITES"] and "site" in m.columns:
+            keep = keep & ~m["site"].isin(CONFIG["EXCLUDE_SITES"])
         mk = m.loc[keep]
         flag_raw = mk[FLAG_FIELD].astype(str).str.strip().str.lower() \
             if FLAG_FIELD in mk.columns else pd.Series("unknown", index=mk.index)
@@ -821,8 +825,18 @@ def main():
     ap.add_argument("--perm-jobs", type=int, default=None,
                     help="parallel workers for the T1 permutation loop")
     ap.add_argument("--nperm", type=int, default=None, help="override N_PERM")
+    ap.add_argument("--exclude-dcr", action="store_true",
+                    help="drop the DCR registry so the analysis is AddNeuroMed centres only")
+    ap.add_argument("--out", default=None,
+                    help="results file name inside output/ (default results.json)")
     args = ap.parse_args()
-    global NTHREAD, DEVICE, PERM_JOBS
+    global NTHREAD, DEVICE, PERM_JOBS, RESULTS
+    if args.exclude_dcr:
+        CONFIG["EXCLUDE_SITES"] = ["DCR"]
+        if args.out is None:
+            args.out = "results_anm.json"
+    if args.out:
+        RESULTS = os.path.join(OUT_DIR, args.out)
     if args.nthread:
         NTHREAD = args.nthread
     if args.device:
