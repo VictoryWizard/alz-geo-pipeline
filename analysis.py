@@ -153,6 +153,18 @@ def parse_series_matrix(path):
 
     samples = header_rows["Sample_geo_accession"][0]
     meta = pd.DataFrame(index=samples)
+    # BeadChip barcode and array position live in Sample_title (e.g. "4856076025_A");
+    # the recruitment-centre code is the leading alpha run of Sample_description.
+    if "Sample_title" in header_rows:
+        t = header_rows["Sample_title"][0]
+        meta["chip"] = [str(v).split("_")[0] for v in t]
+        meta["array_pos"] = [str(v).split("_")[1] if "_" in str(v) else "" for v in t]
+    if "Sample_description" in header_rows:
+        import re as _re
+        d = header_rows["Sample_description"][0]
+        meta["subject_code"] = d
+        meta["site"] = [(_re.match(r"[A-Za-z]+", str(v)) or _re.match(r"", "")).group(0)[:3]
+                        for v in d]
     for row in header_rows.get("Sample_characteristics_ch1", []):
         field = next((c.split(":", 1)[0].strip().lower() for c in row if ":" in c), None)
         if field is None:
@@ -194,6 +206,8 @@ def load_data():
             sex=(mk["gender"].astype(str).str.strip().str.lower()
                  == "female").astype(int).values,
             flag=(flag_raw == "yes").astype(int).values,
+            chip=mk["chip"].values if "chip" in mk.columns else None,
+            site=mk["site"].values if "site" in mk.columns else None,
         )
         info["n"][g] = dict(total=int(keep.sum()),
                             AD=int(D[g]["y"].sum()),
@@ -459,12 +473,16 @@ def stage_A5(D):
         "Random forest": lambda: RandomForestClassifier(
             n_estimators=500, random_state=CONFIG["SEED"], n_jobs=NTHREAD),
     }
-    out = {}
+    out = load_results().get("A5", {})
     for g in CONFIG["SERIES"]:
-        for rule in ("STRICT-100", "DETECTED"):
+        for rule in ("STRICT-100", "DETECTED", "ALL"):
+            if f"{g}|{rule}" in out:
+                P(f"  {g:<12}{rule:<12}cached")
+                continue
             row = {name: fam_cv(D[g]["X"], D[g]["y"], rule, mk)
                    for name, mk in fams.items()}
             out[f"{g}|{rule}"] = row
+            save_stage("A5", out)
             P(f"  {g:<12}{rule:<12}" + "".join(f"{v:>9.3f}" for v in row.values())
               + "    (" + ", ".join(fams) + ")")
     save_stage("A5", out)
@@ -650,10 +668,144 @@ def stage_T1(D):
     return out
 
 
+# ========================================================================= A7
+def stage_A7(D):
+    """Technical batch: BeadChip barcode and recruitment centre.
+
+    Both are recoverable from the series matrix (Sample_title carries the chip
+    barcode and array position; Sample_description carries a subject code whose
+    leading letters are the centre). Neither appears in the characteristics
+    fields, which is why they were missed initially.
+    """
+    P("=" * 88)
+    P("A7  BATCH STRUCTURE: BEADCHIP AND RECRUITMENT CENTRE")
+    P("=" * 88)
+    out = {}
+    for g in CONFIG["SERIES"]:
+        X, y = D[g]["X"], D[g]["y"]
+        for var in ("chip", "site"):
+            v = D[g][var]
+            if v is None:
+                continue
+            lev = sorted(set(v))
+            tab = np.array([[int(((v == L) & (y == c)).sum()) for L in lev] for c in (1, 0)])
+            tab = tab[:, tab.sum(axis=0) > 0]
+            chi2, pv, dof, _ = stats.chi2_contingency(tab)
+            pure = int(((tab == 0).any(axis=0)).sum())
+            n_pure = int(tab[:, (tab == 0).any(axis=0)].sum())
+            out[f"{g}|{var}|balance"] = dict(
+                n_levels=int(tab.shape[1]), chi2=float(chi2), dof=int(dof), p=float(pv),
+                levels_single_diagnosis=pure, samples_in_those=n_pure,
+                counts={str(L): [int(((v == L) & (y == 1)).sum()),
+                                 int(((v == L) & (y == 0)).sum())] for L in lev})
+            P(f"  {g}  {var:<5} {tab.shape[1]:>3} levels | chi2={chi2:>7.1f} dof={dof:>3} "
+              f"p={pv:.3g} | single-diagnosis levels {pure} covering {n_pure} samples")
+
+            # can the probes identify the batch variable itself?
+            for rule in ("STRICT-100", "DETECTED"):
+                codes = {L: i for i, L in enumerate(lev)}
+                yv = np.array([codes[a] for a in v])
+                keep = np.array([np.sum(yv == c) >= 8 for c in yv])
+                if keep.sum() < 40 or len(set(yv[keep])) < 2:
+                    continue
+                acc = multiclass_cv(X[keep], yv[keep], rule)
+                base = float(np.max(np.bincount(yv[keep])) / keep.sum())
+                out[f"{g}|{var}|predict|{rule}"] = dict(
+                    accuracy=acc, majority_baseline=base, n=int(keep.sum()),
+                    n_classes=int(len(set(yv[keep]))))
+                P(f"      predict {var:<5} from {rule:<11} acc {acc:.3f} "
+                  f"(majority baseline {base:.3f}, {len(set(yv[keep]))} classes)")
+        save_stage("A7", out)
+    save_stage("A7", out)
+    return out
+
+
+def multiclass_cv(X, y, rule):
+    """Accuracy at predicting a multi-level batch variable, 5-fold, floor per fold."""
+    from sklearn.ensemble import RandomForestClassifier
+    skf = StratifiedKFold(3, shuffle=True, random_state=CONFIG["SEED"])
+    accs = []
+    for tr, te in skf.split(X, y):
+        T = floor_of(X[tr])
+        cols = np.where(RULES[rule](X[tr], T))[0]
+        A, B = rank_rows(X[np.ix_(tr, cols)]), rank_rows(X[np.ix_(te, cols)])
+        sel = SelectKBest(f_classif, k=min(CONFIG["N_TOP"], A.shape[1])).fit(A, y[tr])
+        m = RandomForestClassifier(n_estimators=300, random_state=CONFIG["SEED"],
+                                   n_jobs=NTHREAD).fit(sel.transform(A), y[tr])
+        accs.append(float((m.predict(sel.transform(B)) == y[te]).mean()))
+    return float(np.mean(accs))
+
+
+# ========================================================================= A8
+def stage_A8(D):
+    """Leave-one-clinic-out. Train on every recruitment centre but one, test on
+    the held-out centre. If the signal survives a clinic the model never saw,
+    clinic imbalance cannot be what produces it.
+
+    Primary metric is the POOLED out-of-fold AUC: every subject is scored by a
+    model that never saw their clinic, then all those scores are ranked together.
+    Per-clinic AUCs are also reported but are noisy where a centre is small.
+    """
+    P("=" * 88)
+    P("A8  LEAVE-ONE-CLINIC-OUT")
+    P("=" * 88)
+    out = load_results().get("A8", {})
+    for g in CONFIG["SERIES"]:
+        X, y, site = D[g]["X"], D[g]["y"], D[g]["site"]
+        if site is None:
+            P(f"  {g}: no site field, skipped")
+            continue
+        for rule in ("STRICT-100", "DETECTED"):
+            if f"{g}|{rule}" in out:
+                P(f"  {g:<12}{rule:<12}cached")
+                continue
+            oof = np.full(len(y), np.nan)
+            per = {}
+            for s in sorted(set(site)):
+                te = site == s
+                tr = ~te
+                if tr.sum() < 40 or len(set(y[tr])) < 2 or te.sum() < 3:
+                    continue
+                T = floor_of(X[tr])
+                cols = np.where(RULES[rule](X[tr], T))[0]
+                if len(cols) < 10:
+                    continue
+                A = rank_rows(X[np.ix_(np.where(tr)[0], cols)])
+                B = rank_rows(X[np.ix_(np.where(te)[0], cols)])
+                sc = fit_score(A, y[tr], B)
+                oof[te] = sc
+                per[str(s)] = dict(n=int(te.sum()), n_AD=int(y[te].sum()),
+                                   n_CTL=int((y[te] == 0).sum()), n_probes=int(len(cols)),
+                                   auc=float(roc_auc_score(y[te], sc))
+                                   if len(set(y[te])) == 2 else None)
+            m = ~np.isnan(oof)
+            pooled = float(roc_auc_score(y[m], oof[m])) if len(set(y[m])) == 2 else None
+            # bootstrap the pooled estimate
+            lo = hi = None
+            if pooled is not None:
+                ys, ss = y[m], oof[m]
+                bs = [roc_auc_score(ys[i], ss[i])
+                      for i in boot_indices(ys, 1000, CONFIG["BOOT_SEED"])]
+                lo, hi = ci(bs)
+            out[f"{g}|{rule}"] = dict(pooled_auc=pooled, lo=lo, hi=hi,
+                                      n_scored=int(m.sum()), n_clinics=len(per),
+                                      per_clinic=per)
+            P(f"  {g:<12}{rule:<12}pooled {pooled:.3f} [{lo:.3f}, {hi:.3f}]  "
+              f"n={int(m.sum())} across {len(per)} clinics")
+            for k, v in sorted(per.items()):
+                a = f"{v['auc']:.3f}" if v["auc"] is not None else "  n/a"
+                P(f"      {k:<8} n={v['n']:>3} ({v['n_AD']} AD / {v['n_CTL']} CTL)  auc {a}")
+            save_stage("A8", out)
+    save_stage("A8", out)
+    return out
+
+
 # ======================================================================== main
 STAGES = dict(A1=stage_A1, A2=stage_A2, A3=stage_A3, A4=stage_A4, A5=stage_A5,
-              A6=stage_A6, R1=stage_R1, R2=stage_R2, R3=stage_R3, T1=stage_T1)
-GROUPS = dict(fast=["A1", "A2", "A3", "A4", "A5", "R1", "R2", "R3"],
+              A6=stage_A6, A7=stage_A7, A8=stage_A8, R1=stage_R1, R2=stage_R2,
+              R3=stage_R3,
+              T1=stage_T1)
+GROUPS = dict(fast=["A1", "A2", "A3", "A4", "A5", "A7", "A8", "R1", "R2", "R3"],
               all=list(STAGES))
 
 
